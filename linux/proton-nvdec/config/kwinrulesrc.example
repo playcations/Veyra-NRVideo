@@ -1,0 +1,15 @@
+[1]
+Description=Keep Veyra fullscreen across display mode changes
+fullscreen=true
+fullscreenrule=2
+noborder=true
+noborderrule=2
+title=Veyra 
+titlematch=2
+types=1
+wmclass=veyra_qml_ui.exe
+wmclassmatch=1
+
+[General]
+count=1
+rules=1
