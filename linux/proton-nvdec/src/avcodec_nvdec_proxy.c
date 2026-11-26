@@ -659,6 +659,130 @@ void avcodec_free_context(AVCodecContext **pavctx) {
     p_orig_free_context(pavctx);
 }
 
+/* ---- Qt6Gui!QGuiApplication::focusWindow() IAT hook for Wine/Xwayland controller focus ----
+ * On headless Linux (Wine + Xwayland + KWin), fullscreen transitions, DXGI swapchain
+ * recreation, or Moonlight reconnects can drop WM_ACTIVATE/WM_SETFOCUS so Qt's
+ * QGuiApplication::focusWindow() returns NULL and RemotePlay.cpp stops forwarding
+ * DualSense/gamepad input until the user physically clicks the window.
+ */
+typedef void *(*fn_qt_focusWindow)(void);
+static fn_qt_focusWindow p_orig_focusWindow = NULL;
+static void *g_last_qwindow = NULL;
+static HWND g_last_hwnd = NULL;
+static ULONGLONG g_last_nudge_ms = 0;
+static int g_focus_logged = 0;
+
+typedef struct FindWinCtx {
+    DWORD pid;
+    HWND found;
+} FindWinCtx;
+
+static BOOL CALLBACK enum_veyra_win_cb(HWND hwnd, LPARAM lp) {
+    FindWinCtx *ctx = (FindWinCtx *)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid) return TRUE;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+    char title[128] = {0};
+    GetWindowTextA(hwnd, title, sizeof(title) - 1);
+    if (strncmp(title, "Veyra ", 6) == 0 && title[6] >= '0' && title[6] <= '9') {
+        ctx->found = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND find_veyra_main_hwnd(void) {
+    if (g_last_hwnd && IsWindow(g_last_hwnd) && IsWindowVisible(g_last_hwnd) && !IsIconic(g_last_hwnd))
+        return g_last_hwnd;
+    FindWinCtx ctx = { GetCurrentProcessId(), NULL };
+    EnumWindows(enum_veyra_win_cb, (LPARAM)&ctx);
+    if (ctx.found) g_last_hwnd = ctx.found;
+    return ctx.found;
+}
+
+static void *hook_qt_focusWindow(void) {
+    if (!p_orig_focusWindow) return NULL;
+    void *w = p_orig_focusWindow();
+    if (w) {
+        g_last_qwindow = w;
+        if (!g_last_hwnd) find_veyra_main_hwnd();
+        return w;
+    }
+
+    HWND hwnd = find_veyra_main_hwnd();
+    if (!hwnd) {
+        g_last_qwindow = NULL;
+        return NULL;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    if (now - g_last_nudge_ms >= 500) {
+        g_last_nudge_ms = now;
+        SetForegroundWindow(hwnd);
+        SetFocus(hwnd);
+        w = p_orig_focusWindow();
+        if (!w) {
+            /* Synchronously notify Qt's Windows QPA WndProc so QGuiApplication::focusWindow()
+             * binds to Veyra's real QWindow* without needing a synthetic mouse click. */
+            SendMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+            SendMessageW(hwnd, WM_SETFOCUS, 0, 0);
+            w = p_orig_focusWindow();
+        }
+        if (w) {
+            g_last_qwindow = w;
+            if (!g_focus_logged) {
+                g_focus_logged = 1;
+                ensure_orig_loaded();
+                nvdec_log(NULL, AV_LOG_INFO, "auto-focus restored Qt focusWindow=%p for hwnd=%p", w, (void *)hwnd);
+            }
+            return w;
+        }
+    }
+
+    if (g_last_qwindow && IsWindow(hwnd)) {
+        return g_last_qwindow;
+    }
+    return NULL;
+}
+
+static void install_focus_iat_hook(void) {
+    const char *env_dis = getenv("VEYRA_ALWAYS_FOCUS");
+    if (env_dis && env_dis[0] == '0') return;
+
+    HMODULE exe = GetModuleHandleA(NULL);
+    if (!exe) return;
+    uint8_t *base = (uint8_t *)exe;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    IMAGE_DATA_DIRECTORY imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!imp_dir.VirtualAddress) return;
+
+    IMAGE_IMPORT_DESCRIPTOR *imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + imp_dir.VirtualAddress);
+    for (; imp->Name; ++imp) {
+        const char *dll_name = (const char *)(base + imp->Name);
+        if (_stricmp(dll_name, "Qt6Gui.dll") != 0) continue;
+        IMAGE_THUNK_DATA64 *orig_thunk = (IMAGE_THUNK_DATA64 *)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        IMAGE_THUNK_DATA64 *iat_thunk  = (IMAGE_THUNK_DATA64 *)(base + imp->FirstThunk);
+        for (; orig_thunk->u1.AddressOfData; ++orig_thunk, ++iat_thunk) {
+            if (IMAGE_SNAP_BY_ORDINAL64(orig_thunk->u1.Ordinal)) continue;
+            IMAGE_IMPORT_BY_NAME *ibn = (IMAGE_IMPORT_BY_NAME *)(base + orig_thunk->u1.AddressOfData);
+            if (strcmp((const char *)ibn->Name, "?focusWindow@QGuiApplication@@SAPEAVQWindow@@XZ") == 0) {
+                DWORD old_prot = 0;
+                if (VirtualProtect(&iat_thunk->u1.Function, sizeof(void *), PAGE_READWRITE, &old_prot)) {
+                    p_orig_focusWindow = (fn_qt_focusWindow)(uintptr_t)iat_thunk->u1.Function;
+                    iat_thunk->u1.Function = (ULONGLONG)(uintptr_t)&hook_qt_focusWindow;
+                    VirtualProtect(&iat_thunk->u1.Function, sizeof(void *), old_prot, &old_prot);
+                    nvdec_debug_file("installed Qt6Gui!QGuiApplication::focusWindow IAT hook");
+                }
+                return;
+            }
+        }
+    }
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     (void)hinst;
     (void)reserved;
@@ -666,6 +790,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
         DisableThreadLibraryCalls(hinst);
         InitializeCriticalSection(&g_lock);
         g_lock_init = 1;
+        install_focus_iat_hook();
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_lock_init) {
             DeleteCriticalSection(&g_lock);
