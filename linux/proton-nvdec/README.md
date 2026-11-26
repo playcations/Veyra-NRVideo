@@ -20,3 +20,4 @@ Requires `gcc-mingw-w64-x86-64-posix`, FFmpeg `n9.0.1` headers (`libavcodec`, `l
 ## Runtime environment variables
 - `VEYRA_NVDEC=0` — bypass NVDEC and use 4-thread slice CPU software decode
 - `VEYRA_NVDEC_LOG=1` — enable verbose logging (writes `/tmp/veyra-nvdec-proxy.log` inside the Wine environment)
+- `VEYRA_ALWAYS_FOCUS=0` — disable the in-process `Qt6Gui!QGuiApplication::focusWindow()` IAT auto-focus guard (enabled by default to keep DualSense controller forwarding active across Wine/Xwayland focus drops)

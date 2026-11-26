@@ -29,7 +29,7 @@ echo "Building ${OUT_DIR}/avcodec-63.dll ..."
     -o "${OUT_DIR}/avcodec-63.dll" \
     "${ROOT}/src/avcodec_nvdec_proxy.c" \
     "${OUT_DIR}/avcodec-63.def" \
-    -Wl,--enable-stdcall-fixup
+    -luser32 -Wl,--enable-stdcall-fixup
 
 echo "Building ${OUT_DIR}/test_nvdec.exe ..."
 "$CC" "${CFLAGS[@]}" \
