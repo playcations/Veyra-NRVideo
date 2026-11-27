@@ -947,7 +947,10 @@ Window {
     Connections {
         target: veyra
         function onPlaylistRequested() { onboarding.close(); playlistWindow.open() }
-        function onNotice(text, isError) { toast.show(text, isError) }
+        function onNotice(text, isError) {
+            toast.show(text, isError)
+            if (isError && text.indexOf("2002") >= 0) ps5AutoWake.trigger()
+        }
         function onWarningNotice(text) { toast.show(text, false, true) }
         function onOverlayRestartSuggested(kind) { onboarding.close(); overlayRestart.kind = kind; overlayRestart.open() }
         function onNavigate(p) {
@@ -959,6 +962,40 @@ Window {
                 return
             }
             root.goPage(p === "export" ? "exp" : p)
+        }
+    }
+
+    // Auto-wake a PS5 in Rest Mode (error 2002) and reconnect automatically.
+    QtObject {
+        id: ps5AutoWake
+        property double lastWakeMs: 0
+        property int retriesLeft: 0
+        function trigger() {
+            const now = Date.now()
+            if (now - lastWakeMs < 45000) return
+            lastWakeMs = now
+            retriesLeft = 3
+            veyra.ps5Load()
+            veyra.ps5Wake()
+            toast.show(qsTr("PS5 is in Rest Mode — waking and reconnecting..."), false, true)
+            ps5AutoWakeTimer.interval = 9000
+            ps5AutoWakeTimer.restart()
+        }
+    }
+    Timer {
+        id: ps5AutoWakeTimer
+        repeat: false
+        onTriggered: {
+            if (veyra.running || veyra.ps5.active) { ps5AutoWake.retriesLeft = 0; return }
+            if (ps5AutoWake.retriesLeft <= 0) return
+            ps5AutoWake.retriesLeft -= 1
+            veyra.ps5Load()
+            if (veyra.ps5Connect()) {
+                if (root.page === "home") root.goPage("min")
+            } else if (ps5AutoWake.retriesLeft > 0) {
+                interval = 5000
+                restart()
+            }
         }
     }
 
